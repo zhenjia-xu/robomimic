@@ -10,10 +10,76 @@ from copy import deepcopy
 import mujoco_py
 import robosuite
 from robosuite.utils.mjcf_utils import postprocess_model_xml
-
+import robosuite.utils.transform_utils as T
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.envs.env_base as EB
+from scipy.spatial.transform import Rotation
 
+
+def get_camera_intrinsic_matrix(sim, camera_name, camera_height, camera_width):
+    """
+    Obtains camera intrinsic matrix.
+
+    Args:
+        sim (MjSim): simulator instance
+        camera_name (str): name of camera
+        camera_height (int): height of camera images in pixels
+        camera_width (int): width of camera images in pixels
+    Return:
+        K (np.array): 3x3 camera matrix
+    """
+    cam_id = sim.model.camera_name2id(camera_name)
+    fovy = sim.model.cam_fovy[cam_id]
+    f = 0.5 * camera_height / np.tan(fovy * np.pi / 360)
+    K = np.array([[f, 0, camera_width / 2], [0, f, camera_height / 2], [0, 0, 1]])
+    return K
+
+
+def get_camera_extrinsic_matrix(sim, camera_name):
+    """
+    Returns a 4x4 homogenous matrix corresponding to the camera pose in the
+    world frame. MuJoCo has a weird convention for how it sets up the
+    camera body axis, so we also apply a correction so that the x and y
+    axis are along the camera view and the z axis points along the
+    viewpoint.
+    Normal camera convention: https://docs.opencv.org/2.4/modules/calib3d/doc/camera_calibration_and_3d_reconstruction.html
+
+    Args:
+        sim (MjSim): simulator instance
+        camera_name (str): name of camera
+    Return:
+        R (np.array): 4x4 camera extrinsic matrix
+    """
+    cam_id = sim.model.camera_name2id(camera_name)
+    camera_pos = sim.data.cam_xpos[cam_id]
+    camera_rot = sim.data.cam_xmat[cam_id].reshape(3, 3)
+    R = T.make_pose(camera_pos, camera_rot)
+
+    # IMPORTANT! This is a correction so that the camera axis is set up along the viewpoint correctly.
+    camera_axis_correction = np.array(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, -1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+    )
+    R = R @ camera_axis_correction
+    return R
+
+def get_real_depth_map(sim, depth_map):
+    """
+    By default, MuJoCo will return a depth map that is normalized in [0, 1]. This
+    helper function converts the map so that the entries correspond to actual distances.
+    (see https://github.com/deepmind/dm_control/blob/master/dm_control/mujoco/engine.py#L742)
+    Args:
+        sim (MjSim): simulator instance
+        depth_map (np.array): depth map with values normalized in [0, 1] (default depth map
+            returned by MuJoCo)
+    Return:
+        depth_map (np.array): depth map that corresponds to actual distances
+    """
+    # Make sure that depth values are normalized
+    assert np.all(depth_map >= 0.0) and np.all(depth_map <= 1.0)
+    extent = sim.model.stat.extent
+    far = sim.model.vis.map.zfar * extent
+    near = sim.model.vis.map.znear * extent
+    return near / (1.0 - depth_map * (1.0 - near / far))
 
 class EnvRobosuite(EB.EnvBase):
     """Wrapper class for robosuite environments (https://github.com/ARISE-Initiative/robosuite)"""
@@ -60,7 +126,6 @@ class EnvRobosuite(EB.EnvBase):
             ignore_done=True,
             use_object_obs=True,
             use_camera_obs=use_image_obs,
-            camera_depths=False,
         )
         kwargs.update(update_kwargs)
 
@@ -181,7 +246,8 @@ class EnvRobosuite(EB.EnvBase):
             di = self.env._get_observations(force_update=True) if self._is_v1 else self.env._get_observation()
         ret = {}
         for k in di:
-            if (k in ObsUtils.OBS_KEYS_TO_MODALITIES) and ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb"):
+            # if (k in ObsUtils.OBS_KEYS_TO_MODALITIES) and ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb"):
+            if (k in ObsUtils.OBS_KEYS_TO_MODALITIES):
                 ret[k] = di[k][::-1]
                 if self.postprocess_visual_obs:
                     ret[k] = ObsUtils.process_obs(obs=ret[k], obs_key=k)
@@ -195,7 +261,8 @@ class EnvRobosuite(EB.EnvBase):
                 # ensures that we don't accidentally add robot wrist images a second time
                 pf = robot.robot_model.naming_prefix
                 for k in di:
-                    if k.startswith(pf) and (k not in ret) and (not k.endswith("proprio-state")):
+                    if k.startswith(pf) and (k not in ret) and \
+                            (not k.endswith("proprio-state")) and (k in ObsUtils.OBS_KEYS_TO_MODALITIES):
                         ret[k] = np.array(di[k])
         else:
             # minimal proprioception for older versions of robosuite
@@ -203,7 +270,39 @@ class EnvRobosuite(EB.EnvBase):
             ret["eef_pos"] = np.array(di["eef_pos"])
             ret["eef_quat"] = np.array(di["eef_quat"])
             ret["gripper_qpos"] = np.array(di["gripper_qpos"])
+            
+        for cam_name, cam_height, cam_width in zip(self.env.camera_names, self.env.camera_heights, self.env.camera_widths):
+            if f"{cam_name}_depth" in ret:
+                ret[f"{cam_name}_depth"], ret[f"{cam_name}_xyz"] = self.get_xyz_from_depth(ret[f"{cam_name}_depth"], cam_name, cam_height, cam_width)
         return ret
+
+    def get_xyz_from_depth(self, depth_map, camera_name, camera_height, camera_width):
+        """
+        Converts uv-map (obtained using camera height and width) and depth-map to (x,y,z) coordinates
+        whose units are same as in the depth map.
+        Args:
+            camera_name (str)
+            camera_height (int)
+            camera_width (int)
+            depth_map (2x2 array): depth map (normalized returned by mujoco)
+        """
+        def parse_intrinsics(K):
+            fx = K[0, 0]
+            fy = K[1, 1]
+            cx = K[0, 2]
+            cy = K[1, 2]
+            return fx, fy, cx, cy
+        intrinsics = get_camera_intrinsic_matrix(self.env.sim, camera_name, camera_height, camera_width)
+        extrinsics = get_camera_extrinsic_matrix(self.env.sim, camera_name)
+        depth_map = get_real_depth_map(self.env.sim, depth_map).squeeze()
+        fx, fy, cx, cy = parse_intrinsics(intrinsics)
+        uv = np.mgrid[0:camera_width, 0:camera_height]
+        x = (uv[0] - cx) / fx * depth_map
+        y = (uv[1] - cy) / fy * depth_map
+        cam_pts = [y, x, depth_map, np.ones_like(depth_map)]
+        cam_pts = np.stack(cam_pts, axis=-1)  # shape [..., 4]
+        points = np.matmul(extrinsics, cam_pts.reshape([-1, 4]).T).T.reshape(cam_pts.shape)
+        return depth_map, points[..., :3]
 
     def get_state(self):
         """
@@ -288,7 +387,8 @@ class EnvRobosuite(EB.EnvBase):
         camera_names, 
         camera_height, 
         camera_width, 
-        reward_shaping, 
+        reward_shaping,
+        camera_depths,
         **kwargs,
     ):
         """
@@ -326,8 +426,11 @@ class EnvRobosuite(EB.EnvBase):
 
         # also initialize obs utils so it knows which modalities are image modalities
         image_modalities = list(camera_names)
+        depth_modalities = list(camera_names)
         if is_v1:
             image_modalities = ["{}_image".format(cn) for cn in camera_names]
+            if camera_depths:
+                depth_modalities = ["{}_depth".format(cn) for cn in camera_names]
         elif has_camera:
             # v0.3 only had support for one image, and it was named "rgb"
             assert len(image_modalities) == 1
@@ -336,6 +439,7 @@ class EnvRobosuite(EB.EnvBase):
             "obs": {
                 "low_dim": [], # technically unused, so we don't have to specify all of them
                 "rgb": image_modalities,
+                "depth": depth_modalities,
             }
         }
         ObsUtils.initialize_obs_utils_with_obs_specs(obs_modality_specs)
@@ -347,6 +451,7 @@ class EnvRobosuite(EB.EnvBase):
             render_offscreen=has_camera, 
             use_image_obs=has_camera, 
             postprocess_visual_obs=False,
+            camera_depths=camera_depths
             **kwargs,
         )
 

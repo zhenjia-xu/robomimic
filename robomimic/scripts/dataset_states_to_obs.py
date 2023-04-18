@@ -148,6 +148,7 @@ def dataset_states_to_obs(args):
         camera_height=args.camera_height, 
         camera_width=args.camera_width, 
         reward_shaping=args.shaped,
+        camera_depths=args.camera_depths
     )
 
     print("==== Using environment with the following metadata ====")
@@ -264,6 +265,13 @@ if __name__ == "__main__":
         "--shaped", 
         action='store_true',
         help="(optional) use shaped rewards",
+    )
+
+    # add depth and xyz
+    parser.add_argument(
+        "--camera_depths", 
+        action='store_true',
+        help="add depth image and xyz image",
     )
 
     # camera names to use for observations

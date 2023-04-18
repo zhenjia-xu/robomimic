@@ -198,6 +198,7 @@ def create_env_for_data_processing(
     camera_height, 
     camera_width, 
     reward_shaping,
+    camera_depths
 ):
     """
     Creates environment for processing dataset observations and rewards.
@@ -218,6 +219,8 @@ def create_env_for_data_processing(
         camera_width (int): camera width for all cameras
 
         reward_shaping (bool): if True, use shaped environment rewards, else use sparse task completion rewards
+    
+        camera_depths (bool): if True, add depth and xyz images
     """
     env_name = env_meta["env_name"]
     env_type = get_env_type(env_meta=env_meta)
@@ -231,6 +234,7 @@ def create_env_for_data_processing(
     env_kwargs.pop("camera_height", None)
     env_kwargs.pop("camera_width", None)
     env_kwargs.pop("reward_shaping", None)
+    env_kwargs.pop("camera_depths", None)
 
     return env_class.create_for_data_processing(
         env_name=env_name, 
@@ -238,5 +242,6 @@ def create_env_for_data_processing(
         camera_height=camera_height, 
         camera_width=camera_width, 
         reward_shaping=reward_shaping, 
+        camera_depths=camera_depths
         **env_kwargs,
     )
