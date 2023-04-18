@@ -242,6 +242,6 @@ def create_env_for_data_processing(
         camera_height=camera_height, 
         camera_width=camera_width, 
         reward_shaping=reward_shaping, 
-        camera_depths=camera_depths
+        camera_depths=camera_depths,
         **env_kwargs,
     )
