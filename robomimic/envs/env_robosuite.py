@@ -451,7 +451,7 @@ class EnvRobosuite(EB.EnvBase):
             render_offscreen=has_camera, 
             use_image_obs=has_camera, 
             postprocess_visual_obs=False,
-            camera_depths=camera_depths
+            camera_depths=camera_depths,
             **kwargs,
         )
 
